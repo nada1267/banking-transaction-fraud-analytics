@@ -1,0 +1,413 @@
+# =========================================================
+# load_data.py
+# Banking Transaction & Fraud Analytics
+# Production Data Loader
+# =========================================================
+
+import os
+import pandas as pd
+
+from dotenv import load_dotenv
+from psycopg import sql
+
+from db_connection import get_connection
+
+
+# =========================================================
+# 1. LOAD ENVIRONMENT VARIABLES
+# =========================================================
+
+load_dotenv()
+
+
+# =========================================================
+# 2. PROJECT PATHS
+# =========================================================
+
+BASE_DIR = os.path.dirname(
+    os.path.dirname(
+        os.path.abspath(__file__)
+    )
+)
+
+DATA_DIR = os.path.join(
+    BASE_DIR,
+    "data"
+)
+
+
+# =========================================================
+# 3. TABLES TO LOAD
+#
+# These are currently empty in PostgreSQL.
+# Other production tables already contain data.
+# =========================================================
+
+TABLES = [
+    "transactions",
+    "transfers",
+    "fraud_alerts"
+]
+
+
+# =========================================================
+# 4. CHECK CURRENT ROW COUNT
+# =========================================================
+
+def get_row_count(connection, table_name):
+
+    with connection.cursor() as cursor:
+
+        query = sql.SQL(
+            """
+            SELECT COUNT(*)
+            FROM production.{table}
+            """
+        ).format(
+            table=sql.Identifier(table_name)
+        )
+
+        cursor.execute(query)
+
+        return cursor.fetchone()[0]
+
+
+# =========================================================
+# 5. LOAD CSV FILE
+# =========================================================
+
+def load_table(connection, table_name):
+
+    file_path = os.path.join(
+        DATA_DIR,
+        f"{table_name}.csv"
+    )
+
+    print()
+    print("-" * 60)
+    print(f"Loading: {table_name}.csv")
+    print("-" * 60)
+
+
+    # -----------------------------------------------------
+    # Check CSV file
+    # -----------------------------------------------------
+
+    if not os.path.exists(file_path):
+
+        raise FileNotFoundError(
+            f"CSV file not found: {file_path}"
+        )
+
+
+    # -----------------------------------------------------
+    # Check existing PostgreSQL rows
+    #
+    # Prevent duplicate data loading.
+    # -----------------------------------------------------
+
+    existing_rows = get_row_count(
+        connection,
+        table_name
+    )
+
+
+    if existing_rows > 0:
+
+        print(
+            f"[SKIP] production.{table_name} "
+            f"already contains "
+            f"{existing_rows:,} rows."
+        )
+
+        return
+
+
+    # -----------------------------------------------------
+    # Read CSV
+    # -----------------------------------------------------
+
+    dataframe = pd.read_csv(
+        file_path
+    )
+
+
+    print(
+        f"Rows found in CSV: "
+        f"{len(dataframe):,}"
+    )
+
+
+    # -----------------------------------------------------
+    # Check empty CSV
+    # -----------------------------------------------------
+
+    if dataframe.empty:
+
+        print(
+            f"[WARNING] "
+            f"{table_name}.csv is empty."
+        )
+
+        return
+
+
+    # =====================================================
+    # 6. DATA CLEANING
+    # =====================================================
+
+
+    # -----------------------------------------------------
+    # Nullable ID columns
+    #
+    # card_id and merchant_id may contain missing values.
+    # Convert them to nullable integers.
+    # -----------------------------------------------------
+
+    nullable_id_columns = [
+        "card_id",
+        "merchant_id"
+    ]
+
+
+    for column in nullable_id_columns:
+
+        if column in dataframe.columns:
+
+            dataframe[column] = (
+                dataframe[column]
+                .astype("Int64")
+            )
+
+
+    # -----------------------------------------------------
+    # Convert date columns
+    # -----------------------------------------------------
+
+    date_columns = [
+        "transaction_date",
+        "transfer_date",
+        "created_at"
+    ]
+
+
+    for column in date_columns:
+
+        if column in dataframe.columns:
+
+            dataframe[column] = pd.to_datetime(
+                dataframe[column],
+                errors="coerce"
+            )
+
+
+    # -----------------------------------------------------
+    # Convert pandas missing values to Python None.
+    #
+    # PostgreSQL receives None as SQL NULL.
+    # -----------------------------------------------------
+
+    dataframe = dataframe.astype(object)
+
+    dataframe = dataframe.where(
+        pd.notna(dataframe),
+        None
+    )
+
+
+    # =====================================================
+    # 7. FRAUD ALERT ID
+    #
+    # alert_id is generated by PostgreSQL identity.
+    # Therefore we do NOT insert alert_id from CSV.
+    # =====================================================
+
+    if table_name == "fraud_alerts":
+
+        if "alert_id" in dataframe.columns:
+
+            dataframe = dataframe.drop(
+                columns=["alert_id"]
+            )
+
+            print(
+                "[INFO] alert_id excluded. "
+                "PostgreSQL identity will generate it."
+            )
+
+
+    # =====================================================
+    # 8. PREPARE INSERT
+    # =====================================================
+
+    columns = list(
+        dataframe.columns
+    )
+
+
+    column_list = sql.SQL(", ").join(
+        sql.Identifier(column)
+        for column in columns
+    )
+
+
+    placeholders = sql.SQL(", ").join(
+        sql.Placeholder(column)
+        for column in columns
+    )
+
+
+    query = sql.SQL(
+        """
+        INSERT INTO production.{table}
+        ({columns})
+        VALUES ({values})
+        """
+    ).format(
+        table=sql.Identifier(table_name),
+        columns=column_list,
+        values=placeholders
+    )
+
+
+    # -----------------------------------------------------
+    # Convert DataFrame to records
+    # -----------------------------------------------------
+
+    records = dataframe.to_dict(
+        orient="records"
+    )
+
+
+    # =====================================================
+    # 9. INSERT DATA
+    # =====================================================
+
+    with connection.cursor() as cursor:
+
+        cursor.executemany(
+            query,
+            records
+        )
+
+
+    # =====================================================
+    # 10. VALIDATE INSERTED ROW COUNT
+    # =====================================================
+
+    inserted_rows = get_row_count(
+        connection,
+        table_name
+    )
+
+
+    print(
+        f"[PASS] production.{table_name}"
+    )
+
+    print(
+        f"Rows in PostgreSQL: "
+        f"{inserted_rows:,}"
+    )
+
+
+# =========================================================
+# 11. MAIN ETL PROCESS
+# =========================================================
+
+def main():
+
+    connection = None
+
+
+    try:
+
+        print("=" * 60)
+        print("BANKING FRAUD ANALYTICS")
+        print("PRODUCTION DATA LOADER")
+        print("=" * 60)
+
+
+        # -------------------------------------------------
+        # Database connection
+        # -------------------------------------------------
+
+        connection = get_connection()
+
+
+        print(
+            "\nDatabase connection successful."
+        )
+
+
+        # =================================================
+        # LOAD TABLES
+        # =================================================
+
+        for table_name in TABLES:
+
+            load_table(
+                connection,
+                table_name
+            )
+
+
+        # =================================================
+        # COMMIT
+        #
+        # All tables succeed before committing.
+        # =================================================
+
+        connection.commit()
+
+
+        print()
+        print("=" * 60)
+        print("DATA LOADING COMPLETED SUCCESSFULLY")
+        print("=" * 60)
+
+
+    # =====================================================
+    # ERROR HANDLING
+    # =====================================================
+
+    except Exception as error:
+
+        if connection is not None:
+
+            connection.rollback()
+
+
+        print()
+        print("=" * 60)
+        print("DATA LOADING FAILED")
+        print("=" * 60)
+
+        print()
+        print(
+            f"Error: {error}"
+        )
+
+
+    # =====================================================
+    # CLOSE CONNECTION
+    # =====================================================
+
+    finally:
+
+        if connection is not None:
+
+            connection.close()
+
+            print(
+                "\nDatabase connection closed."
+            )
+
+
+# =========================================================
+# 12. RUN APPLICATION
+# =========================================================
+
+if __name__ == "__main__":
+
+    main()
