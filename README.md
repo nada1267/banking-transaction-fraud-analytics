@@ -54,9 +54,6 @@ Analytics & Fraud Detection
               └────────────┬────────────┘
                            ▼
                     Validation
-تمام 👌 راجعت تنظيم المشروع الفعلي. عندك ملفات الـ SQL والـ Python والـ Docker والـ data فعلًا، والـ README موجود في الـ root.  
-
-دلوقتي افتحي `README.md` وانسخي فيه المحتوى ده بالكامل:
 
 ````md
 # Banking Transaction & Fraud Analytics
